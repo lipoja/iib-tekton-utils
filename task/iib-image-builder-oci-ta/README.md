@@ -1,39 +1,93 @@
 # iib-image-builder-oci-ta task
 
-The iib-image-builder task builds source code into multi-architecture index images using Python orchestration with buildah. This task is specifically designed for building Operator Index Images that contain file-based catalogs.
+Tekton task that builds multi-architecture Operator Index Images from a Trusted Artifact using Python orchestration and buildah. It is designed for file-based catalogs (FBC) and follows the same build settings model as [IIB](https://github.com/release-engineering/iib).
 
-The task performs the following operations:
-- Generates OPM cache from file-based catalog (JSON or YAML files)
-- Builds container images for multiple architectures (amd64, arm64, ppc64le, s390x)
-- Creates and pushes multi-architecture manifest list
+## Overview
+
+The task runs two steps:
+
+1. **`use-trusted-artifact`** — extracts the application source from a Trusted Artifact URI into `/var/workdir/source`.
+2. **`build-multi-arch`** — runs `multi-arch-builder.py`, which:
+   - loads build settings from the IIB build metadata JSON file,
+   - generates an OPM cache from the file-based catalog under `configs/`,
+   - builds a per-architecture image with `buildah bud` for each target arch,
+   - assembles and pushes a multi-architecture manifest list with `buildah manifest`.
+
+Build settings `opm_version`, `labels`, `arches`, and `binary_image` are read **only** from the IIB build metadata file (default `.iib-build-metadata.json` in the build context). Override the path with the `IIB_BUILD_METADATA_FILE_PATH` parameter.
+
+Tekton parameters and environment variables (`IMAGE`, `COMMIT_SHA`, `CONTEXT`, `DOCKERFILE`, …) control where and how the build runs, not the index content itself.
+
+## Expected source layout
+
+The Trusted Artifact should contain at least:
+
+```
+.
+├── .iib-build-metadata.json   # IIB build settings (see below)
+├── configs/                   # file-based catalog (JSON or YAML)
+└── Dockerfile                 # index image Dockerfile (or path via DOCKERFILE param)
+```
+
+During the build, OPM writes a cache under `/var/workdir/cache`, then copies it into `<CONTEXT>/cache` so the Dockerfile can consume it.
+
+## IIB build metadata
+
+Place a JSON file in the build context (default: `.iib-build-metadata.json`). Relative paths in `IIB_BUILD_METADATA_FILE_PATH` are resolved against `CONTEXT`.
+
+| Field | Required | Description |
+|---|---|---|
+| `opm_version` | yes | OPM version for cache generation (e.g. `v1.48.0` or `opm-v1.48.0`) |
+| `arches` | yes | Target architectures, e.g. `["amd64", "arm64", "ppc64le", "s390x"]` |
+| `labels` | no | Object of label key/value pairs applied to built images |
+| `binary_image` | no | Passed to the Dockerfile as `BINARY_IMAGE` build arg |
+
+Example:
+
+```json
+{
+  "opm_version": "opm-v1.48.0",
+  "arches": ["amd64", "arm64"],
+  "labels": {
+    "com.redhat.index.delivery.version": "v4.19",
+    "com.redhat.index.delivery.distribution_scope": "prod"
+  },
+  "binary_image": "quay.io/operator-framework/upstream-registry-builder@sha256:7c8068817855b55e60ff5c2591c494130c2d105e0cc062836a5438a42935f8f8"
+}
+```
+
+Supported OPM versions are bundled in the task image: `v1.26.4`, `v1.40.0`, `v1.44.0`, and `v1.48.0`.
 
 ## Parameters
 
-|name|description|default value|required|
+| Name | Description | Default | Required |
 |---|---|---|---|
-|COMMIT_SHA|The image is built from this commit.|""|true|
-|CONTEXT|Path to the directory to use as context.|.|false|
-|DOCKERFILE|Path to the Dockerfile to build.|./Dockerfile|false|
-|IMAGE|Reference of the image buildah will produce.||true|
-|LABELS|Additional key=value labels that should be applied to the image (comma-separated)|""|false|
-|SOURCE_ARTIFACT|The Trusted Artifact URI pointing to the artifact with the application source code.||true|
-|STORAGE_DRIVER|Storage driver to configure for buildah|overlay|false|
-|PLATFORMS|Comma-separated list of platforms to build for (e.g., amd64,arm64,ppc64le,s390x)|amd64,arm64,ppc64le,s390x|false|
-|OPM_VERSION|OPM version to use for cache generation|v1.40.0|false|
-|caTrustConfigMapKey|The name of the key in the ConfigMap that contains the CA bundle data.|ca-bundle.crt|false|
-|caTrustConfigMapName|The name of the ConfigMap to read CA bundle data from.|trusted-ca|false|
+| `IMAGE` | Image reference buildah will push | — | yes |
+| `SOURCE_ARTIFACT` | Trusted Artifact URI with application source | — | yes |
+| `COMMIT_SHA` | Commit SHA; added as an extra manifest tag when set | `""` | yes at runtime* |
+| `CONTEXT` | Build context directory (relative to extracted source) | `.` | no |
+| `DOCKERFILE` | Path to the Dockerfile (relative to extracted source) | `./Dockerfile` | no |
+| `IIB_BUILD_METADATA_FILE_PATH` | Path to IIB build metadata JSON (relative to `CONTEXT` unless absolute) | `.iib-build-metadata.json` | no |
+| `STORAGE_DRIVER` | buildah storage driver | `overlay` | no |
+| `caTrustConfigMapName` | ConfigMap containing the CA bundle | `trusted-ca` | no |
+| `caTrustConfigMapKey` | Key in the ConfigMap with CA bundle data | `ca-bundle.crt` | no |
+
+\* `COMMIT_SHA` has an empty Tekton default but `multi-arch-builder.py` fails the build if it is not set.
 
 ## Results
 
-|name|description|
+| Name | Description |
 |---|---|
-|IMAGE_DIGEST|Digest of the multi-arch image manifest|
-|IMAGE_REF|Image reference of the built multi-arch image (includes digest)|
-|IMAGE_URL|Image repository and tag where the built image was pushed|
+| `IMAGE_DIGEST` | Digest of the pushed multi-arch manifest |
+| `IMAGE_REF` | Full image reference with digest (`name@sha256:…`) |
+| `IMAGE_URL` | Image repository and tag (`name:tag`) |
+
+## Resource requirements
+
+The task step template requests 4 CPU / 4 Gi memory and limits memory to 16 Gi. Multi-arch index builds with OPM cache generation are memory-intensive; adjust cluster quotas accordingly.
 
 ## Usage
 
-### Basic Usage
+### Basic TaskRun
 
 ```yaml
 apiVersion: tekton.dev/v1
@@ -52,7 +106,7 @@ spec:
       value: "oci://source-artifact"
 ```
 
-### Advanced Usage with Custom Parameters
+### Custom context, Dockerfile, and metadata path
 
 ```yaml
 apiVersion: tekton.dev/v1
@@ -69,21 +123,18 @@ spec:
       value: "abc123def456"
     - name: SOURCE_ARTIFACT
       value: "oci://source-artifact"
-    - name: PLATFORMS
-      value: "amd64,arm64"
-    - name: LABELS
-      value: "<label-name>=<label-value>, <label2-name>=<label2-value>"
-    - name: OPM_VERSION
-      value: "v1.40.0"
     - name: CONTEXT
       value: "./operator"
     - name: DOCKERFILE
-      value: "./operator/Dockerfile"
+      value: "./operator/index.Dockerfile"
+    - name: IIB_BUILD_METADATA_FILE_PATH
+      value: ".iib-build-metadata.json"
 ```
 
-## Related Documentation
+## Related documentation
 
 - [Operator Lifecycle Manager (OLM)](https://olm.operatorframework.io/)
-- [File-based Catalogs](https://olm.operatorframework.io/docs/concepts/olm-architecture/operator-catalog/creating-a-catalog/#file-based-catalogs)
+- [File-based catalogs](https://olm.operatorframework.io/docs/concepts/olm-architecture/operator-catalog/creating-a-catalog/#file-based-catalogs)
 - [OPM (Operator Package Manager)](https://github.com/operator-framework/operator-registry)
 - [Buildah](https://buildah.io/)
+- [Repository README](../../README.md) — tests, container image build, and repository layout

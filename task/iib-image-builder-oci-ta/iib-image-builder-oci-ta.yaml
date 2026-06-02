@@ -26,13 +26,13 @@ spec:
       description: Path to the Dockerfile to build.
       type: string
       default: ./Dockerfile
+    - name: IIB_BUILD_METADATA_FILE_PATH
+      description: Path to the IIB build metadata JSON file, relative to the build context unless absolute.
+      type: string
+      default: .iib-build-metadata.json
     - name: IMAGE
       description: Reference of the image buildah will produce.
       type: string
-    - name: LABELS
-      description: Additional key=value labels that should be applied to the image
-      type: string
-      default: ""
     - name: SOURCE_ARTIFACT
       description: The Trusted Artifact URI pointing to the artifact with the application source code.
       type: string
@@ -40,14 +40,6 @@ spec:
       description: Storage driver to configure for buildah
       type: string
       default: overlay
-    - name: PLATFORMS
-      description: Comma-separated list of platforms to build for (e.g., amd64,arm64,ppc64le,s390x)
-      type: string
-      default: "amd64,arm64,ppc64le,s390x"
-    - name: OPM_VERSION
-      description: OPM version to use for cache generation
-      type: string
-      default: "v1.40.0"
     - name: caTrustConfigMapKey
       description: The name of the key in the ConfigMap that contains the CA bundle data.
       type: string
@@ -93,16 +85,12 @@ spec:
         value: $(params.CONTEXT)
       - name: DOCKERFILE
         value: $(params.DOCKERFILE)
+      - name: IIB_BUILD_METADATA_FILE_PATH
+        value: $(params.IIB_BUILD_METADATA_FILE_PATH)
       - name: IMAGE
         value: $(params.IMAGE)
-      - name: LABELS
-        value: $(params.LABELS)
       - name: STORAGE_DRIVER
         value: $(params.STORAGE_DRIVER)
-      - name: PLATFORMS
-        value: $(params.PLATFORMS)
-      - name: OPM_VERSION
-        value: $(params.OPM_VERSION)
       - name: CACHE_DIR
         value: /var/workdir/cache
     volumeMounts:
@@ -126,20 +114,21 @@ spec:
     - name: build-multi-arch
       image: quay.io/exd-guild-hello-operator/iib-build-task:latest
       workingDir: /var/workdir
+      env:
+        - name: IIB_BUILD_METADATA_FILE_PATH
+          value: $(params.IIB_BUILD_METADATA_FILE_PATH)
       script: |
         #!/bin/bash
         set -euo pipefail
 
-        echo "Labels: $LABELS"
-        echo "OPM Version: $OPM_VERSION"
-        echo "Platforms: $PLATFORMS"
-
         echo "[$(date --utc -Ins)] Starting multi-architecture build with Python orchestration"
+        echo "IIB build metadata file path: $(params.IIB_BUILD_METADATA_FILE_PATH)"
 
         # Run the Python build script
         python3 -u /usr/local/bin/multi-arch-builder.py \
           --ca-bundle /mnt/trusted-ca/ca-bundle.crt \
-          --output /var/workdir/build-results.json
+          --output /var/workdir/build-results.json \
+          --iib-build-metadata-file-path "$(params.IIB_BUILD_METADATA_FILE_PATH)"
 
         # Extract results for Tekton
         if [ -f "/var/workdir/build-results.json" ]; then

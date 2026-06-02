@@ -91,10 +91,8 @@ OPTIONAL_PARAMS_WITH_DEFAULTS = {
     "COMMIT_SHA": "",
     "CONTEXT": ".",
     "DOCKERFILE": "./Dockerfile",
-    "LABELS": "",
+    "IIB_BUILD_METADATA_FILE_PATH": ".iib-build-metadata.json",
     "STORAGE_DRIVER": "overlay",
-    "PLATFORMS": "amd64,arm64,ppc64le,s390x",
-    "OPM_VERSION": "v1.40.0",
     "caTrustConfigMapKey": "ca-bundle.crt",
     "caTrustConfigMapName": "trusted-ca",
 }
@@ -126,10 +124,11 @@ class TestTaskParameters:
         for name, param in params_by_name.items():
             assert param.get("description"), f"Param '{name}' is missing 'description'"
 
-    def test_platforms_default_covers_all_arches(self, params_by_name):
-        default = params_by_name["PLATFORMS"]["default"]
-        for arch in ("amd64", "arm64", "ppc64le", "s390x"):
-            assert arch in default, f"Architecture '{arch}' missing from PLATFORMS default"
+    def test_iib_build_metadata_file_path_default(self, params_by_name):
+        assert (
+            params_by_name["IIB_BUILD_METADATA_FILE_PATH"]["default"]
+            == ".iib-build-metadata.json"
+        )
 
     def test_image_param_is_string_type(self, params_by_name):
         assert params_by_name["IMAGE"]["type"] == "string"
@@ -218,7 +217,12 @@ class TestStepTemplate:
     def test_step_template_propagates_required_env_vars(self, spec):
         step_template = spec.get("stepTemplate", {})
         env_names = {e["name"] for e in step_template.get("env", [])}
-        for required in ("IMAGE", "COMMIT_SHA", "PLATFORMS", "OPM_VERSION", "CACHE_DIR"):
+        for required in (
+            "IMAGE",
+            "COMMIT_SHA",
+            "IIB_BUILD_METADATA_FILE_PATH",
+            "CACHE_DIR",
+        ):
             assert required in env_names, f"stepTemplate must expose env var '{required}'"
 
     def test_step_template_mounts_shared_and_workdir_volumes(self, spec):
@@ -288,6 +292,16 @@ class TestTaskSteps:
     def test_build_step_script_uses_set_euo_pipefail(self, steps_by_name):
         script = steps_by_name["build-multi-arch"].get("script", "")
         assert "set -euo pipefail" in script
+
+    def test_build_step_passes_metadata_file_path_to_python(self, steps_by_name):
+        script = steps_by_name["build-multi-arch"].get("script", "")
+        assert "--iib-build-metadata-file-path" in script
+        assert "IIB_BUILD_METADATA_FILE_PATH" in script
+
+    def test_build_step_sets_metadata_file_path_env(self, steps_by_name):
+        step = steps_by_name["build-multi-arch"]
+        env_names = {e["name"] for e in step.get("env", [])}
+        assert "IIB_BUILD_METADATA_FILE_PATH" in env_names
 
     def test_trusted_artifact_step_has_image(self, steps_by_name):
         assert steps_by_name["use-trusted-artifact"].get("image"), (
