@@ -65,3 +65,43 @@ def builder(build_config):
     import multi_arch_builder as mab
 
     return mab.MultiArchBuilder(build_config)
+
+
+@pytest.fixture()
+def sample_iib_metadata():
+    """Sample IIB build metadata as used in PRs."""
+    return {
+        "opm_version": "opm-v1.48.0",
+        "labels": {
+            "com.redhat.index.delivery.version": "v4.19",
+            "com.redhat.index.delivery.distribution_scope": "prod",
+        },
+        "binary_image": (
+            "quay.io/operator-framework/upstream-registry-builder"
+            "@sha256:7c8068817855b55e60ff5c2591c494130c2d105e0cc062836a5438a42935f8f8"
+        ),
+        "request_id": 89240,
+        "arches": ["amd64"],
+    }
+
+
+@pytest.fixture()
+def metadata_build_context(tmp_path, sample_iib_metadata, monkeypatch):
+    """
+    Build context with ``.iib-build-metadata.json`` and Tekton env vars set.
+    """
+    import json
+
+    context = tmp_path / "index-build"
+    context.mkdir()
+    (context / ".iib-build-metadata.json").write_text(
+        json.dumps(sample_iib_metadata), encoding="utf-8"
+    )
+
+    monkeypatch.setenv("IMAGE", "quay.io/org/index:v1.0")
+    monkeypatch.setenv("COMMIT_SHA", "abc123def456")
+    monkeypatch.setenv("CONTEXT", str(context))
+    monkeypatch.setenv("DOCKERFILE", str(context / "index.Dockerfile"))
+    monkeypatch.delenv("IIB_BUILD_METADATA_FILE_PATH", raising=False)
+
+    return context

@@ -25,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_IIB_BUILD_METADATA_FILE_PATH = '.iib-build-metadata.json'
+
 
 class IIBBaseException(Exception):
     """The base class for all IIB exceptions."""
@@ -132,6 +134,7 @@ class BuildConfig:
     cache_dir: str
     commit_sha: str
     opm_version: str
+    binary_image: str = ''
     # Architecture mapping for platform names to expected architecture values
     arch_map: Dict[str, str] = field(default_factory=lambda: {
         'amd64': 'amd64',
@@ -141,10 +144,157 @@ class BuildConfig:
     })
 
 
+def resolve_iib_build_metadata_path(context_path: str, metadata_file_path: str) -> Path:
+    """
+    Resolve the IIB build metadata file path.
+
+    Relative paths are resolved against the build context directory.
+
+    :param str context_path: build context directory
+    :param str metadata_file_path: path to the metadata file
+    :return: absolute path to the metadata file
+    :rtype: Path
+    """
+    path = Path(metadata_file_path)
+    if path.is_absolute():
+        return path
+    return Path(context_path) / path
+
+
+def load_iib_build_metadata(metadata_path: Path) -> Dict[str, Any]:
+    """
+    Load IIB build metadata from the configured metadata file.
+
+    :param Path metadata_path: path to the metadata JSON file
+    :return: parsed metadata as a dictionary
+    :rtype: Dict[str, Any]
+    :raises IIBError: if the file is missing or contains invalid JSON
+    """
+    if not metadata_path.is_file():
+        raise IIBError(
+            f'IIB build metadata file not found: {metadata_path}'
+        )
+
+    logger.info('Loading IIB build metadata from %s', metadata_path)
+    try:
+        with open(metadata_path, encoding='utf-8') as metadata_file:
+            metadata = json.load(metadata_file)
+    except json.JSONDecodeError as exc:
+        raise IIBError(f'Invalid JSON in {metadata_path}: {exc}') from exc
+
+    if not isinstance(metadata, dict):
+        raise IIBError(
+            f'IIB build metadata must be a JSON object, got {type(metadata).__name__}'
+        )
+
+    return metadata
+
+
+def opm_version_from_metadata(metadata: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract ``opm_version`` from IIB build metadata.
+
+    Strips the ``opm-`` prefix when present (e.g. ``opm-v1.48.0`` -> ``v1.48.0``).
+
+    :param dict metadata: IIB build metadata
+    :return: normalized OPM version, or None if not set in metadata
+    :rtype: Optional[str]
+    """
+    raw_version = metadata.get('opm_version')
+    if raw_version is None:
+        return None
+
+    version = str(raw_version).strip()
+    if version.startswith('opm-'):
+        version = version[len('opm-'):]
+    return version
+
+
+def labels_from_metadata(metadata: Dict[str, Any]) -> Optional[List[str]]:
+    """
+    Extract ``labels`` from IIB build metadata.
+
+    :param dict metadata: IIB build metadata
+    :return: list of ``key=value`` labels, or None if not set in metadata
+    :rtype: Optional[List[str]]
+    :raises IIBError: if ``labels`` is present but not a JSON object
+    """
+    raw_labels = metadata.get('labels')
+    if raw_labels is None:
+        return None
+
+    if not isinstance(raw_labels, dict):
+        raise IIBError(
+            'Invalid labels in IIB build metadata file: '
+            f'expected object, got {type(raw_labels).__name__}'
+        )
+
+    return [f'{key}={value}' for key, value in raw_labels.items()]
+
+
+def arches_from_metadata(metadata: Dict[str, Any]) -> Optional[List[str]]:
+    """
+    Extract ``arches`` from IIB build metadata.
+
+    :param dict metadata: IIB build metadata
+    :return: list of platform/arch names, or None if not set in metadata
+    :rtype: Optional[List[str]]
+    :raises IIBError: if ``arches`` is present but invalid or empty
+    """
+    raw_arches = metadata.get('arches')
+    if raw_arches is None:
+        return None
+
+    if not isinstance(raw_arches, list):
+        raise IIBError(
+            'Invalid arches in IIB build metadata file: '
+            f'expected array, got {type(raw_arches).__name__}'
+        )
+
+    arches = [str(arch).strip() for arch in raw_arches if str(arch).strip()]
+    if not arches:
+        raise IIBError(
+            'Invalid arches in IIB build metadata file: '
+            'array must contain at least one architecture'
+        )
+
+    return arches
+
+
+def binary_image_from_metadata(metadata: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract ``binary_image`` from IIB build metadata.
+
+    :param dict metadata: IIB build metadata
+    :return: container image reference for the index binary image, or None if not set
+    :rtype: Optional[str]
+    :raises IIBError: if ``binary_image`` is present but invalid or empty
+    """
+    raw_binary_image = metadata.get('binary_image')
+    if raw_binary_image is None:
+        return None
+
+    if not isinstance(raw_binary_image, str):
+        raise IIBError(
+            'Invalid binary_image in IIB build metadata file: '
+            f'expected string, got {type(raw_binary_image).__name__}'
+        )
+
+    binary_image = raw_binary_image.strip()
+    if not binary_image:
+        raise IIBError(
+            'Invalid binary_image in IIB build metadata file: '
+            'value must not be empty'
+        )
+
+    return binary_image
+
+
 def generate_cache_locally(
     base_dir: str,
     fbc_dir: str,
     local_cache_path: str,
+    opm_version: str,
 ) -> None:
     """
     Generate the cache for the index image locally before building it.
@@ -152,12 +302,12 @@ def generate_cache_locally(
     :param str base_dir: base directory where cache should be created.
     :param str fbc_dir: directory containing file-based catalog (JSON or YAML files).
     :param str local_cache_path: path to the locally generated cache.
+    :param str opm_version: OPM version used to select the ``opm`` binary (e.g. ``v1.48.0``).
     :return: Returns path to generated cache
     :rtype: str
     :raises: IIBError when cache was not generated
 
     """
-    opm_version = os.environ.get('OPM_VERSION', 'v1.40.0')
     opm_binary = f"/usr/bin/opm-{opm_version}"
 
     cmd = [
@@ -312,7 +462,9 @@ class MultiArchBuilder:
         # Add labels
         for label in self.config.labels:
             cmd.extend(['--label', label.strip()])
-        
+
+        if self.config.binary_image:
+            cmd.extend(['--build-arg', f'BINARY_IMAGE={self.config.binary_image}'])
 
         # Add context
         cmd.append(self.config.context_path)
@@ -464,7 +616,8 @@ class MultiArchBuilder:
         generate_cache_locally(
             base_dir=self.config.context_path,
             fbc_dir=str(catalog_dir),
-            local_cache_path=self.config.cache_dir
+            local_cache_path=self.config.cache_dir,
+            opm_version=self.config.opm_version,
         )
         
         # Copy cache into build context so Dockerfile can access it
@@ -504,20 +657,30 @@ class MultiArchBuilder:
         manifest_data = json.loads(result)
         digest = manifest_data.get('Digest', '')
         
-        return {
+        results: Dict[str, Any] = {
             'image_name': self.config.image_name,
             'digest': digest,
             'platforms': self.config.platforms,
             'platform_images': platform_images,
-            'opm_version': self.config.opm_version
+            'opm_version': self.config.opm_version,
         }
+        if self.config.binary_image:
+            results['binary_image'] = self.config.binary_image
+        return results
 
 
-def load_config_from_env() -> BuildConfig:
+def load_config_from_env(metadata_file_path: Optional[str] = None) -> BuildConfig:
     """
-    Load configuration from environment variables.
+    Load configuration from IIB build metadata and Tekton environment variables.
 
-    :return: BuildConfig object populated from environment variables
+    Values defined in the IIB build metadata file (``opm_version``, ``labels``,
+    ``arches``, ``binary_image``) are read only from that file. The file path is
+    set via ``--iib-build-metadata-file-path`` or the ``IIB_BUILD_METADATA_FILE_PATH``
+    environment variable. Environment variables are used for Tekton/task settings
+    (``IMAGE``, ``COMMIT_SHA``, etc.).
+
+    :param Optional[str] metadata_file_path: path to the metadata file (overrides env)
+    :return: BuildConfig object populated from metadata and environment variables
     :rtype: BuildConfig
     """
     # Source code is extracted to /var/workdir/source by the use-trusted-artifact step
@@ -532,16 +695,69 @@ def load_config_from_env() -> BuildConfig:
     dockerfile_path = os.environ.get('DOCKERFILE', './Dockerfile')
     if not dockerfile_path.startswith('/'):
         dockerfile_path = os.path.join(source_dir, dockerfile_path)
-    
+
+    if metadata_file_path is None:
+        metadata_file_path = (
+            os.environ.get('IIB_BUILD_METADATA_FILE_PATH')
+            or DEFAULT_IIB_BUILD_METADATA_FILE_PATH
+        )
+    metadata_file_path = metadata_file_path.strip() or DEFAULT_IIB_BUILD_METADATA_FILE_PATH
+    logger.info('IIB build metadata file path: %s', metadata_file_path)
+
+    metadata_path = resolve_iib_build_metadata_path(context_path, metadata_file_path)
+    metadata = load_iib_build_metadata(metadata_path)
+
+    opm_version = opm_version_from_metadata(metadata)
+    if opm_version is None:
+        raise IIBError(
+            f'opm_version is required in {metadata_path}'
+        )
+    logger.info(
+        'OPM version %s loaded from %s',
+        opm_version,
+        metadata_path,
+    )
+
+    labels = labels_from_metadata(metadata)
+    if labels is None:
+        labels = []
+    logger.info(
+        'Loaded %d label(s) from %s',
+        len(labels),
+        metadata_path,
+    )
+
+    platforms = arches_from_metadata(metadata)
+    if platforms is None:
+        raise IIBError(
+            f'arches is required in {metadata_path}'
+        )
+    logger.info(
+        'Platforms %s loaded from %s (arches)',
+        ', '.join(platforms),
+        metadata_path,
+    )
+
+    binary_image = binary_image_from_metadata(metadata) or ''
+    if binary_image:
+        logger.info(
+            'Binary image %s loaded from %s',
+            binary_image,
+            metadata_path,
+        )
+    else:
+        logger.info('No binary_image configured in %s', metadata_path)
+
     return BuildConfig(
         image_name=os.environ.get('IMAGE', ''),
         dockerfile_path=dockerfile_path,
         context_path=context_path,
-        platforms=os.environ.get('PLATFORMS', 'amd64,arm64,ppc64le,s390x').split(','),
-        labels=os.environ.get('LABELS', '').split(','),
+        platforms=platforms,
+        labels=labels,
         cache_dir=os.environ.get('CACHE_DIR', '/var/workdir/cache'),
         commit_sha=os.environ.get('COMMIT_SHA', ''),
-        opm_version=os.environ.get('OPM_VERSION', 'v1.40.0'),
+        opm_version=opm_version,
+        binary_image=binary_image,
     )
 
 
@@ -555,12 +771,22 @@ def main():
     parser = argparse.ArgumentParser(description='Multi-architecture container builder')
     parser.add_argument('--ca-bundle', help='Path to CA bundle file')
     parser.add_argument('--output', help='Path to output results JSON file')
-    
+    parser.add_argument(
+        '--iib-build-metadata-file-path',
+        default=os.environ.get(
+            'IIB_BUILD_METADATA_FILE_PATH',
+            DEFAULT_IIB_BUILD_METADATA_FILE_PATH,
+        ),
+        help=(
+            'Path to IIB build metadata JSON file '
+            '(relative to CONTEXT unless absolute; default: .iib-build-metadata.json)'
+        ),
+    )
+
     args = parser.parse_args()
-    
+
     try:
-        # Load configuration from environment
-        config = load_config_from_env()
+        config = load_config_from_env(metadata_file_path=args.iib_build_metadata_file_path)
         
         # Validate required fields
         if not config.image_name or not config.commit_sha:

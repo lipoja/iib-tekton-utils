@@ -6,6 +6,7 @@ filename contains a hyphen) and registered in sys.modules as
 ``multi_arch_builder``.
 """
 import json
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch, call
@@ -180,12 +181,12 @@ class TestGenerateCacheLocally:
 
         mock_run_cmd.side_effect = side_effect
 
-        with patch.dict("os.environ", {"OPM_VERSION": "v1.40.0"}):
-            mab.generate_cache_locally(
-                base_dir=str(tmp_path),
-                fbc_dir=str(fbc_dir),
-                local_cache_path=str(cache_dir),
-            )
+        mab.generate_cache_locally(
+            base_dir=str(tmp_path),
+            fbc_dir=str(fbc_dir),
+            local_cache_path=str(cache_dir),
+            opm_version="v1.40.0",
+        )
 
         mock_run_cmd.assert_called_once()
         cmd_arg = mock_run_cmd.call_args[0][0]
@@ -213,6 +214,7 @@ class TestGenerateCacheLocally:
             base_dir=str(tmp_path),
             fbc_dir=str(tmp_path / "fbc"),
             local_cache_path=str(cache_dir),
+            opm_version="v1.40.0",
         )
 
         assert not stale_file.exists()
@@ -232,6 +234,7 @@ class TestGenerateCacheLocally:
                 base_dir=str(tmp_path),
                 fbc_dir=str(tmp_path / "fbc"),
                 local_cache_path=str(cache_dir),
+                opm_version="v1.40.0",
             )
 
     @patch("multi_arch_builder.run_cmd")
@@ -245,10 +248,11 @@ class TestGenerateCacheLocally:
                 base_dir=str(tmp_path),
                 fbc_dir=str(tmp_path / "fbc"),
                 local_cache_path=non_existent,
+                opm_version="v1.40.0",
             )
 
     @patch("multi_arch_builder.run_cmd")
-    def test_uses_opm_version_from_environment(self, mock_run_cmd, tmp_path):
+    def test_uses_opm_version_argument(self, mock_run_cmd, tmp_path):
         cache_dir = tmp_path / "cache"
         cache_dir.mkdir()
 
@@ -257,12 +261,12 @@ class TestGenerateCacheLocally:
 
         mock_run_cmd.side_effect = side_effect
 
-        with patch.dict("os.environ", {"OPM_VERSION": "v1.99.0"}):
-            mab.generate_cache_locally(
-                base_dir=str(tmp_path),
-                fbc_dir=str(tmp_path / "fbc"),
-                local_cache_path=str(cache_dir),
-            )
+        mab.generate_cache_locally(
+            base_dir=str(tmp_path),
+            fbc_dir=str(tmp_path / "fbc"),
+            local_cache_path=str(cache_dir),
+            opm_version="v1.99.0",
+        )
 
         cmd_arg = mock_run_cmd.call_args[0][0]
         assert cmd_arg[0] == "/usr/bin/opm-v1.99.0"
@@ -439,6 +443,23 @@ class TestBuildImage:
         assert cmd[-1] == "/tmp/ctx"
 
     @patch("multi_arch_builder.MultiArchBuilder._verify_image_architecture")
+    @patch("multi_arch_builder.run_cmd")
+    def test_adds_binary_image_build_arg(self, mock_run_cmd, mock_verify, builder):
+        builder.config.binary_image = "quay.io/binary@sha256:abc"
+        builder._build_image("amd64", "quay.io/org/img:latest-amd64")
+        cmd = mock_run_cmd.call_args[0][0]
+        assert "--build-arg" in cmd
+        assert "BINARY_IMAGE=quay.io/binary@sha256:abc" in cmd
+
+    @patch("multi_arch_builder.MultiArchBuilder._verify_image_architecture")
+    @patch("multi_arch_builder.run_cmd")
+    def test_omits_binary_image_build_arg_when_unset(self, mock_run_cmd, mock_verify, builder):
+        builder.config.binary_image = ""
+        builder._build_image("amd64", "quay.io/org/img:latest-amd64")
+        cmd = mock_run_cmd.call_args[0][0]
+        assert "BINARY_IMAGE=" not in cmd
+
+    @patch("multi_arch_builder.MultiArchBuilder._verify_image_architecture")
     @patch("multi_arch_builder.run_cmd", side_effect=mab.ExternalServiceError("503"))
     def test_raises_external_service_error_on_network_failure(
         self, mock_run_cmd, mock_verify, builder
@@ -532,61 +553,218 @@ class TestCreateAndPushManifestList:
 
 
 # ---------------------------------------------------------------------------
+# IIB build metadata helpers
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIibBuildMetadataPath:
+    def test_relative_path_is_resolved_against_context(self, tmp_path):
+        context = tmp_path / "ctx"
+        context.mkdir()
+        resolved = mab.resolve_iib_build_metadata_path(str(context), ".iib-build-metadata.json")
+        assert resolved == context / ".iib-build-metadata.json"
+
+    def test_absolute_path_is_unchanged(self, tmp_path):
+        absolute = tmp_path / "custom" / "metadata.json"
+        absolute.parent.mkdir()
+        resolved = mab.resolve_iib_build_metadata_path(str(tmp_path / "ctx"), str(absolute))
+        assert resolved == absolute
+
+
+class TestLoadIibBuildMetadata:
+    def test_loads_valid_json(self, tmp_path):
+        metadata_file = tmp_path / ".iib-build-metadata.json"
+        metadata_file.write_text('{"opm_version": "v1.48.0"}', encoding="utf-8")
+        assert mab.load_iib_build_metadata(metadata_file) == {"opm_version": "v1.48.0"}
+
+    def test_raises_when_file_missing(self, tmp_path):
+        with pytest.raises(mab.IIBError, match="not found"):
+            mab.load_iib_build_metadata(tmp_path / "missing.json")
+
+    def test_raises_on_invalid_json(self, tmp_path):
+        metadata_file = tmp_path / ".iib-build-metadata.json"
+        metadata_file.write_text("{not json", encoding="utf-8")
+        with pytest.raises(mab.IIBError, match="Invalid JSON"):
+            mab.load_iib_build_metadata(metadata_file)
+
+    def test_raises_when_root_is_not_object(self, tmp_path):
+        metadata_file = tmp_path / ".iib-build-metadata.json"
+        metadata_file.write_text('["array"]', encoding="utf-8")
+        with pytest.raises(mab.IIBError, match="must be a JSON object"):
+            mab.load_iib_build_metadata(metadata_file)
+
+
+class TestOpmVersionFromMetadata:
+    def test_strips_opm_prefix(self):
+        assert mab.opm_version_from_metadata({"opm_version": "opm-v1.48.0"}) == "v1.48.0"
+
+    def test_returns_version_without_prefix(self):
+        assert mab.opm_version_from_metadata({"opm_version": "v1.40.0"}) == "v1.40.0"
+
+    def test_returns_none_when_missing(self):
+        assert mab.opm_version_from_metadata({}) is None
+
+
+class TestLabelsFromMetadata:
+    def test_converts_dict_to_key_value_list(self, sample_iib_metadata):
+        labels = mab.labels_from_metadata(sample_iib_metadata)
+        assert labels == [
+            "com.redhat.index.delivery.version=v4.19",
+            "com.redhat.index.delivery.distribution_scope=prod",
+        ]
+
+    def test_returns_none_when_missing(self):
+        assert mab.labels_from_metadata({}) is None
+
+    def test_raises_when_labels_not_object(self):
+        with pytest.raises(mab.IIBError, match="Invalid labels"):
+            mab.labels_from_metadata({"labels": "bad"})
+
+
+class TestArchesFromMetadata:
+    def test_returns_arch_list(self, sample_iib_metadata):
+        assert mab.arches_from_metadata(sample_iib_metadata) == ["amd64"]
+
+    def test_returns_none_when_missing(self):
+        assert mab.arches_from_metadata({}) is None
+
+    def test_raises_when_arches_not_array(self):
+        with pytest.raises(mab.IIBError, match="Invalid arches"):
+            mab.arches_from_metadata({"arches": "amd64"})
+
+    def test_raises_when_arches_empty(self):
+        with pytest.raises(mab.IIBError, match="at least one architecture"):
+            mab.arches_from_metadata({"arches": []})
+
+
+class TestBinaryImageFromMetadata:
+    def test_returns_image_reference(self, sample_iib_metadata):
+        image = mab.binary_image_from_metadata(sample_iib_metadata)
+        assert image.startswith("quay.io/operator-framework/")
+
+    def test_returns_none_when_missing(self):
+        assert mab.binary_image_from_metadata({}) is None
+
+    def test_raises_when_not_string(self):
+        with pytest.raises(mab.IIBError, match="Invalid binary_image"):
+            mab.binary_image_from_metadata({"binary_image": 123})
+
+    def test_raises_when_empty_string(self):
+        with pytest.raises(mab.IIBError, match="must not be empty"):
+            mab.binary_image_from_metadata({"binary_image": "   "})
+
+
+# ---------------------------------------------------------------------------
 # load_config_from_env
 # ---------------------------------------------------------------------------
 
 
 class TestLoadConfigFromEnv:
-    def _load(self, monkeypatch, overrides=None):
-        defaults = {"IMAGE": "quay.io/org/img:latest", "COMMIT_SHA": "sha123"}
-        env = {**defaults, **(overrides or {})}
-        for k, v in env.items():
-            if v is None:
-                monkeypatch.delenv(k, raising=False)
-            else:
-                monkeypatch.setenv(k, v)
-        return mab.load_config_from_env()
+    def test_loads_values_from_metadata_file(self, metadata_build_context):
+        cfg = mab.load_config_from_env()
+        assert cfg.image_name == "quay.io/org/index:v1.0"
+        assert cfg.commit_sha == "abc123def456"
+        assert cfg.opm_version == "v1.48.0"
+        assert cfg.platforms == ["amd64"]
+        assert cfg.labels == [
+            "com.redhat.index.delivery.version=v4.19",
+            "com.redhat.index.delivery.distribution_scope=prod",
+        ]
+        assert cfg.binary_image.startswith("quay.io/operator-framework/")
 
-    def test_loads_image_and_commit_sha(self, monkeypatch):
-        cfg = self._load(monkeypatch)
-        assert cfg.image_name == "quay.io/org/img:latest"
-        assert cfg.commit_sha == "sha123"
+    def test_custom_metadata_file_path(self, metadata_build_context, sample_iib_metadata):
+        custom = metadata_build_context / "meta" / "build.json"
+        custom.parent.mkdir()
+        custom.write_text(json.dumps(sample_iib_metadata), encoding="utf-8")
+        cfg = mab.load_config_from_env(metadata_file_path="meta/build.json")
+        assert cfg.opm_version == "v1.48.0"
 
-    def test_default_platforms(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"PLATFORMS": None})
-        assert cfg.platforms == ["amd64", "arm64", "ppc64le", "s390x"]
+    def test_metadata_file_path_from_env(self, metadata_build_context, monkeypatch):
+        monkeypatch.setenv(
+            "IIB_BUILD_METADATA_FILE_PATH",
+            ".iib-build-metadata.json",
+        )
+        cfg = mab.load_config_from_env()
+        assert cfg.opm_version == "v1.48.0"
 
-    def test_custom_platforms(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"PLATFORMS": "amd64,arm64"})
-        assert cfg.platforms == ["amd64", "arm64"]
+    def test_relative_context_is_joined_with_source_dir(self, tmp_path, monkeypatch):
+        source = tmp_path / "source"
+        ctx = source / "myapp"
+        ctx.mkdir(parents=True)
+        (ctx / ".iib-build-metadata.json").write_text(
+            json.dumps({"opm_version": "v1.40.0", "arches": ["amd64"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("IMAGE", "quay.io/org/img:latest")
+        monkeypatch.setenv("COMMIT_SHA", "sha123")
+        monkeypatch.setenv("CONTEXT", "myapp")
+        monkeypatch.setenv("DOCKERFILE", "./Dockerfile")
 
-    def test_relative_context_is_joined_with_source_dir(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"CONTEXT": "myapp"})
-        assert cfg.context_path == "/var/workdir/source/myapp"
+        real_join = os.path.join
 
-    def test_absolute_context_is_used_as_is(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"CONTEXT": "/absolute/path"})
-        assert cfg.context_path == "/absolute/path"
+        def join_under_tekton_source(first, *rest):
+            if first == "/var/workdir/source" and rest:
+                return str(source / rest[0].lstrip("./"))
+            return real_join(first, *rest)
 
-    def test_relative_dockerfile_is_joined_with_source_dir(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"DOCKERFILE": "./Dockerfile"})
-        assert cfg.dockerfile_path == "/var/workdir/source/./Dockerfile"
+        monkeypatch.setattr(os.path, "join", join_under_tekton_source)
 
-    def test_absolute_dockerfile_is_used_as_is(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"DOCKERFILE": "/abs/Dockerfile"})
-        assert cfg.dockerfile_path == "/abs/Dockerfile"
+        cfg = mab.load_config_from_env()
+        assert cfg.context_path == str(source / "myapp")
 
-    def test_default_opm_version(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"OPM_VERSION": None})
-        assert cfg.opm_version == "v1.40.0"
+    def test_absolute_context_is_used_as_is(self, metadata_build_context, monkeypatch):
+        monkeypatch.setenv("CONTEXT", str(metadata_build_context))
+        cfg = mab.load_config_from_env()
+        assert cfg.context_path == str(metadata_build_context)
 
-    def test_default_cache_dir(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"CACHE_DIR": None})
+    def test_relative_dockerfile_is_joined_with_source_dir(self, monkeypatch, tmp_path):
+        source = tmp_path / "source"
+        ctx = source / "app"
+        ctx.mkdir(parents=True)
+        (ctx / ".iib-build-metadata.json").write_text(
+            json.dumps({"opm_version": "v1.40.0", "arches": ["amd64"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("IMAGE", "quay.io/org/img:latest")
+        monkeypatch.setenv("COMMIT_SHA", "sha123")
+        monkeypatch.setenv("CONTEXT", str(ctx))
+        monkeypatch.setenv("DOCKERFILE", "./index.Dockerfile")
+
+        cfg = mab.load_config_from_env()
+        assert cfg.dockerfile_path == "/var/workdir/source/./index.Dockerfile"
+
+    def test_default_cache_dir(self, metadata_build_context, monkeypatch):
+        monkeypatch.delenv("CACHE_DIR", raising=False)
+        cfg = mab.load_config_from_env()
         assert cfg.cache_dir == "/var/workdir/cache"
 
-    def test_empty_labels_produce_single_empty_string(self, monkeypatch):
-        cfg = self._load(monkeypatch, {"LABELS": None})
-        assert cfg.labels == [""]
+    def test_raises_when_opm_version_missing(self, tmp_path, monkeypatch):
+        context = tmp_path / "ctx"
+        context.mkdir()
+        (context / ".iib-build-metadata.json").write_text(
+            json.dumps({"arches": ["amd64"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("IMAGE", "quay.io/org/img:latest")
+        monkeypatch.setenv("COMMIT_SHA", "sha123")
+        monkeypatch.setenv("CONTEXT", str(context))
+
+        with pytest.raises(mab.IIBError, match="opm_version is required"):
+            mab.load_config_from_env()
+
+    def test_raises_when_arches_missing(self, tmp_path, monkeypatch):
+        context = tmp_path / "ctx"
+        context.mkdir()
+        (context / ".iib-build-metadata.json").write_text(
+            json.dumps({"opm_version": "v1.40.0"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("IMAGE", "quay.io/org/img:latest")
+        monkeypatch.setenv("COMMIT_SHA", "sha123")
+        monkeypatch.setenv("CONTEXT", str(context))
+
+        with pytest.raises(mab.IIBError, match="arches is required"):
+            mab.load_config_from_env()
 
 
 # ---------------------------------------------------------------------------
